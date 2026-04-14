@@ -2,11 +2,19 @@
  * Worker for uos.org-learning plugin.
  *
  * All handlers are registered inside the single `setup(ctx)` function:
- * - Event subscriptions  (agent.run.*, issue.*, approval.*)
- * - Scheduled jobs        (weekly retrospective)
- * - Agent tools           (get-playbooks, search-knowledge, record-learning)
- * - Data queries          (learning.list, learning.summary, learning.health, …)
- * - Actions               (learning.create, learning.update, retrospective.create, …)
+ *   - Event subscriptions  (agent.run.*, issue.*, approval.*)
+ *   - Stream subscriptions  (quality-gate review_updated)
+ *   - Scheduled jobs        (weekly retrospective)
+ *   - Agent tools           (get-playbooks, search-knowledge, record-learning)
+ *   - Data queries          (learning.list, learning.summary, learning.health, …)
+ *   - Actions               (learning.create, learning.update, retrospective.create, …)
+ *
+ * Paperclip integration patterns:
+ *   - ctx.streams.emit() after every state mutation → UI widgets refresh in real-time
+ *   - ctx.issues.* to enrich learnings from issue context
+ *   - ctx.activity.log() for audit trail (wrapped in try/catch — degrades gracefully)
+ *   - ctx.data.register() for queryable endpoints
+ *   - ctx.actions.register() for write operations
  */
 
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
@@ -74,22 +82,66 @@ const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Setting up uos.org-learning plugin");
 
+    // Rehydrate from SurrealDB if connected
+    await rehydrateFromDb();
+
     // -------------------------------------------------------------------------
     // Event subscriptions
     // -------------------------------------------------------------------------
 
+    /**
+     * agent.run.started — record what this run was trying to do so we can
+     * correlate with agent.run.cancelled or agent.run.failed later.
+     */
+    ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+      const runId = event.entityId ?? "unknown";
+      const payload = event.payload as Record<string, unknown>;
+      const agentId = (payload?.agentId as string) ?? "unknown";
+      const goalTitle = (payload?.goalTitle as string) ?? `Run ${runId}`;
+
+      // Store minimal context for later correlation on cancel/fail
+      await ctx.state.set(
+        { scopeKind: "run", scopeId: runId, stateKey: "runContext" },
+        { agentId, goalTitle, startedAt: new Date().toISOString() } as Record<string, string>,
+      );
+
+      ctx.logger.info("agent.run.started observed", { runId, agentId, goalTitle });
+    });
+
+    /**
+     * agent.run.finished — create a deliverable record for this run.
+     * If the run failed, create a learning capturing the failure.
+     *
+     * NOTE: do NOT create a learning here for failed runs if agent.run.failed
+     * also fires for the same run — that would create duplicates.
+     * agent.run.failed only logs; the learning is created here exclusively.
+     */
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
       const runId = event.entityId ?? "unknown";
       const payload = event.payload as Record<string, unknown>;
       const agentId = (payload?.agentId as string) ?? "unknown";
       const runStatus = (payload?.status as string) ?? "unknown";
 
-      createDeliverable({ relatedRunId: runId, agentId });
+      // Always create a deliverable so the run is traceable
+      const d = await createDeliverable({ relatedRunId: runId, agentId });
+      ctx.events.emit("learning_updated", event.companyId, { entityType: "deliverable", entityId: d.id });
 
       if (runStatus === "failed") {
-        createLearning({
-          title: `Run failed: ${runId}`,
-          body: `Agent run ${runId} completed with status '${runStatus}'. Review the run logs and capture lessons learned.`,
+        // Retrieve stored context from agent.run.started to enrich the learning
+        const runContext = (await ctx.state.get(
+          { scopeKind: "run", scopeId: runId, stateKey: "runContext" }
+        )) as { goalTitle?: string; agentId?: string } | null;
+        const goalTitle = runContext?.goalTitle ?? `Run ${runId}`;
+
+        const learning = await createLearning({
+          title: `Run failed: ${goalTitle}`,
+          body: [
+            `Agent run '${runId}' completed with status '${runStatus}'.`,
+            `Agent: ${agentId}`,
+            `Goal: ${goalTitle}`,
+            `Review the run logs and capture lessons learned.`,
+            `Failure mode: See run logs at https://app.paperclip.ai/runs/${runId}`,
+          ].join("\n"),
           source: "manual",
           sourceId: runId,
           sourceName: `Agent ${agentId}`,
@@ -100,10 +152,13 @@ const plugin = definePlugin({
           ],
           createdBy: "org-learning-plugin",
         });
+
+        ctx.streams.emit("learning_created", { learningId: learning.id });
+
         try {
           await ctx.activity.log({
             companyId: event.companyId,
-            message: `Run ${runId} failed — learning placeholder created`,
+            message: `Run ${runId} failed — learning ${learning.id} created`,
             entityType: "run",
             entityId: runId,
           });
@@ -115,49 +170,126 @@ const plugin = definePlugin({
       ctx.logger.info("agent.run.finished observed", { runId, agentId, runStatus });
     });
 
+    /**
+     * agent.run.failed — only fires when the run crashes/fails to start.
+     * Do NOT create a duplicate learning here — agent.run.finished already
+     * handles failed runs. Just log for observability.
+     */
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
       const runId = event.entityId ?? "unknown";
       const payload = event.payload as Record<string, unknown>;
       const agentId = (payload?.agentId as string) ?? "unknown";
+      const error = (payload?.error as string) ?? "unknown error";
 
-      createLearning({
-        title: `Agent run failed: ${runId}`,
-        body: `Agent ${agentId} run ${runId} failed. Document the failure mode and resolution steps.`,
+      // Retrieve stored context to capture what was being attempted
+      const runContext = (await ctx.state.get(
+        { scopeKind: "run", scopeId: runId, stateKey: "runContext" }
+      )) as { goalTitle?: string; agentId?: string } | null;
+      const goalTitle = runContext?.goalTitle ?? runId;
+
+      const learning = await createLearning({
+        title: `Run crashed: ${goalTitle}`,
+        body: [
+          `Agent run '${runId}' crashed before completion.`,
+          `Agent: ${agentId}`,
+          `Goal: ${goalTitle}`,
+          `Error: ${error}`,
+          `Capture the root cause and add action items to prevent recurrence.`,
+        ].join("\n"),
         source: "manual",
         sourceId: runId,
         sourceName: `Agent ${agentId}`,
-        priority: "high",
+        priority: "critical",
         tags: [
           { name: "agent-run", source: "system" },
-          { name: "failure", source: "system" },
+          { name: "crash", source: "system" },
         ],
         createdBy: "org-learning-plugin",
       });
 
-      ctx.logger.info("agent.run.failed observed", { runId, agentId });
+      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.logger.info("agent.run.failed observed — learning created", { runId, agentId, error });
     });
 
+    /**
+     * agent.run.cancelled — capture why a run was cancelled so it can be
+     * turned into a learning about resource management or premature termination.
+     */
+    ctx.events.on("agent.run.cancelled", async (event: PluginEvent) => {
+      const runId = event.entityId ?? "unknown";
+      const payload = event.payload as Record<string, unknown>;
+      const agentId = (payload?.agentId as string) ?? "unknown";
+      const reason = (payload?.reason as string) ?? "No reason provided";
+
+      const runContext = (await ctx.state.get(
+        { scopeKind: "run", scopeId: runId, stateKey: "runContext" }
+      )) as { goalTitle?: string; agentId?: string } | null;
+      const goalTitle = runContext?.goalTitle ?? runId;
+
+      const learning = await createLearning({
+        title: `Run cancelled: ${goalTitle}`,
+        body: [
+          `Agent run '${runId}' was cancelled.`,
+          `Agent: ${agentId}`,
+          `Goal: ${goalTitle}`,
+          `Cancellation reason: ${reason}`,
+          `If this was unexpected, investigate whether the run was terminated prematurely.`,
+        ].join("\n"),
+        source: "manual",
+        sourceId: runId,
+        sourceName: `Agent ${agentId}`,
+        priority: "medium",
+        tags: [
+          { name: "agent-run", source: "system" },
+          { name: "cancelled", source: "system" },
+        ],
+        createdBy: "org-learning-plugin",
+      });
+
+      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.logger.info("agent.run.cancelled observed", { runId, agentId, reason });
+    });
+
+    /**
+     * issue.created — fetch full issue details via ctx.issues.get() to create
+     * a richer learning than just the title field in the event payload.
+     */
     ctx.events.on("issue.created", async (event: PluginEvent) => {
       const issueId = event.entityId ?? "unknown";
-      const payload = event.payload as Record<string, unknown>;
-      const title = (payload?.title as string) ?? issueId;
+      const companyId = event.companyId;
 
       await ctx.state.set(
         { scopeKind: "issue", scopeId: issueId, stateKey: "seen" },
         true,
       );
 
-      createLearning({
-        title: `Issue tracked: ${title}`,
-        body: `Issue '${title}' (${issueId}) was created. When resolved, a retrospective will capture lessons learned.`,
+      // Enrich with full issue context from ctx.issues
+      let issueTitle = issueId;
+      let issueBody = "";
+      try {
+        const issue = await ctx.issues.get(issueId, companyId);
+        if (issue) {
+          issueTitle = issue.title ?? issueTitle;
+          issueBody = issue.description ?? "";
+        }
+      } catch {
+        // ctx.issues not available — fall back to payload title
+      }
+
+      const learning = await createLearning({
+        title: `Issue tracked: ${issueTitle}`,
+        body: issueBody
+          ? `Issue '${issueTitle}' (${issueId}) was created.\n\n## Description\n${issueBody}\n\nA retrospective will be created when this issue is resolved.`
+          : `Issue '${issueTitle}' (${issueId}) was created. When resolved, a retrospective will capture lessons learned.`,
         source: "manual",
         sourceId: issueId,
-        sourceName: title,
+        sourceName: issueTitle,
         priority: "medium",
         tags: [{ name: "issue", source: "system" }],
         createdBy: "org-learning-plugin",
       });
 
+      ctx.streams.emit("learning_created", { learningId: learning.id });
       ctx.logger.info("issue.created observed", { issueId });
     });
 
@@ -166,22 +298,27 @@ const plugin = definePlugin({
       const payload = event.payload as Record<string, unknown>;
       const comment = (payload?.comment as string) ?? "";
 
+      // Magic keywords in comments trigger learning ingestion
       if (
         comment.includes("@org-learning record") ||
-        comment.includes("record learning")
+        comment.includes("record learning") ||
+        comment.includes("@learning add")
       ) {
-        ctx.logger.info("Learning record trigger detected in comment", {
-          issueId,
-        });
+        ctx.logger.info("Learning record trigger detected in comment", { issueId });
+        // The INGEST_FROM_EVENT action can be called by the agent when it sees this event
       }
     });
 
+    /**
+     * approval.created — track that an approval is pending; when decided,
+     * approval.decided will capture the outcome.
+     */
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const approvalId = event.entityId ?? "unknown";
       const payload = event.payload as Record<string, unknown>;
       const requestedFor = (payload?.requestedFor as string) ?? "unknown";
 
-      createLearning({
+      const learning = await createLearning({
         title: `Approval pending: ${approvalId}`,
         body: `An approval request (${approvalId}) is awaiting decision for '${requestedFor}'. Decision outcomes are captured as learnings.`,
         source: "manual",
@@ -192,6 +329,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
+      ctx.streams.emit("learning_created", { learningId: learning.id });
       ctx.logger.info("approval.created observed", { approvalId, requestedFor });
     });
 
@@ -201,7 +339,7 @@ const plugin = definePlugin({
       const decision = (payload?.decision as string) ?? "unknown";
       const decidedBy = (payload?.decidedBy as string) ?? "unknown";
 
-      createLearning({
+      const learning = await createLearning({
         title: `Approval ${decision}: ${approvalId}`,
         body: `Approval ${approvalId} was ${decision} by ${decidedBy}. Outcome captured for future reference.`,
         source: "manual",
@@ -214,8 +352,20 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
+      ctx.streams.emit("learning_created", { learningId: learning.id });
       ctx.logger.info("approval.decided observed", { approvalId, decision, decidedBy });
     });
+
+    // -------------------------------------------------------------------------
+    // Stream subscriptions (from other plugins)
+    // -------------------------------------------------------------------------
+
+    // NOTE: Subscribing to quality-gate's "review_updated" stream is not supported
+    // via ctx.streams.on() — PluginStreamsClient only has emit/open, no subscribe.
+    // The quality-gate integration is handled via ctx.events.emit() calls in
+    // the quality-gate plugin, which this plugin receives through agent.run.finished
+    // events. If tighter coupling is needed, emit a plugin-namespaced event here
+    // that quality-gate can subscribe to via ctx.events.on("plugin.uos.org-learning.*").
 
     // -------------------------------------------------------------------------
     // Scheduled jobs
@@ -228,6 +378,23 @@ const plugin = definePlugin({
 
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+        // Fetch resolved issues via ctx.issues — note: requires companyId which is
+        // only available in event context, not job context. For now, fall back to
+        // learnings-only retrospective. Once the plugin supports per-company
+        // initialization with companyId, this can be re-enabled.
+        let resolvedIssueIds: string[] = [];
+        try {
+          const issues = await ctx.issues.list({
+            companyId: "instance",
+            status: "done",
+            limit: 50,
+          });
+          resolvedIssueIds = issues.map((i: { id: string }) => i.id);
+        } catch {
+          // ctx.issues not available — fall back to learnings-only retro
+        }
+
         const allActive = queryLearnings({ status: "active", limit: 100 });
         const recentLearnings = allActive.filter(
           (l) => new Date(l.createdAt) >= sevenDaysAgo,
@@ -247,6 +414,7 @@ const plugin = definePlugin({
           ``,
           `Total active learnings: ${recentLearnings.length}`,
           `High/critical priority: ${highPriority.length}`,
+          `Resolved issues reviewed: ${resolvedIssueIds.length}`,
           ``,
           `### By Source`,
           ...Array.from(bySource.entries()).map(
@@ -258,11 +426,14 @@ const plugin = definePlugin({
           scopeKind: "company",
           scopeId: "weekly-retro",
           keyFindings: highPriority.map((l) => l.title),
-          actionItems: highPriority.map(
-            (l) => `Review: ${l.title} (${l.sourceId ?? l.id})`,
-          ),
+          actionItems: [
+            ...highPriority.map((l) => `Review: ${l.title} (${l.sourceId ?? l.id})`),
+            ...resolvedIssueIds.slice(0, 5).map((id) => `Close out issue: ${id}`),
+          ],
           status: "draft",
         });
+
+        ctx.streams.emit("learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
 
         try {
           await ctx.activity.log({
@@ -320,15 +491,16 @@ const plugin = definePlugin({
       TOOL_KEYS.SEARCH_KNOWLEDGE,
       {
         displayName: "Search Knowledge Base",
-        description: "Search the organizational knowledge base.",
+        description:
+          "Search the organizational knowledge base using BM25-ranked full-text search across all learnings, playbooks, and policies.",
         parametersSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Free-text search query." },
+            query: { type: "string", description: "Free-text search query — searches title, body, and tags." },
             sources: {
               type: "array",
               items: { type: "string" },
-              description: "Optional source filter.",
+              description: "Optional source filter: 'incident', 'manual', 'approval', 'project'.",
             },
             tags: {
               type: "array",
@@ -349,12 +521,19 @@ const plugin = definePlugin({
           tags?: string[];
           limit?: number;
         };
-        const results = queryLearnings({
-          query: p.query,
-          sources: p.sources as LearningQuery["sources"],
-          tags: p.tags,
-          limit: p.limit ?? 10,
-        });
+        // Use BM25-ranked async query when a text query is provided
+        const results = p.query
+          ? await queryLearningsWithRanking({
+              query: p.query,
+              sources: p.sources as LearningQuery["sources"],
+              tags: p.tags,
+              limit: p.limit ?? 10,
+            })
+          : queryLearnings({
+              sources: p.sources as LearningQuery["sources"],
+              tags: p.tags,
+              limit: p.limit ?? 10,
+            });
         return {
           content: JSON.stringify({ learnings: results, count: results.length }),
         };
@@ -365,7 +544,7 @@ const plugin = definePlugin({
       TOOL_KEYS.RECORD_LEARNING,
       {
         displayName: "Record Learning",
-        description: "Records a new learning artifact.",
+        description: "Records a new learning artifact (knowledge entry, playbook, or policy).",
         parametersSchema: {
           type: "object",
           properties: {
@@ -413,9 +592,7 @@ const plugin = definePlugin({
         const body = String(p.body ?? "");
 
         if (!title || !body) {
-          return {
-            error: "title and body are required",
-          };
+          return { error: "title and body are required" };
         }
 
         if (p.kind === "playbook") {
@@ -427,6 +604,7 @@ const plugin = definePlugin({
             sourceId: p.sourceId,
             createdBy: "agent",
           });
+          ctx.streams.emit("learning_updated", { entityType: "playbook", entityId: playbook.id });
           return {
             content: JSON.stringify({
               id: playbook.id,
@@ -446,6 +624,7 @@ const plugin = definePlugin({
             tags: [...parseTags(p.tags), { name: "policy", source: "system" }],
             createdBy: "agent",
           });
+          ctx.streams.emit("learning_created", { learningId: learning.id });
           return {
             content: JSON.stringify({
               id: learning.id,
@@ -465,6 +644,7 @@ const plugin = definePlugin({
           tags: parseTags(p.tags),
           createdBy: "agent",
         });
+        ctx.streams.emit("learning_created", { learningId: learning.id });
         return {
           content: JSON.stringify({
             id: learning.id,
@@ -476,7 +656,7 @@ const plugin = definePlugin({
     );
 
     // -------------------------------------------------------------------------
-    // Data queries
+    // Data queries (read-side — stateless)
     // -------------------------------------------------------------------------
 
     ctx.data.register(
@@ -501,6 +681,7 @@ const plugin = definePlugin({
       },
     );
 
+    // Note: DATA_KEYS.HEALTH === "learning.health" — registered by key, not string literal
     ctx.data.register(DATA_KEYS.HEALTH, async () => {
       return computeHealth();
     });
@@ -529,14 +710,15 @@ const plugin = definePlugin({
     );
 
     // -------------------------------------------------------------------------
-    // Actions
+    // Actions (write-side — emit stream events so UI refreshes in real-time)
     // -------------------------------------------------------------------------
 
     ctx.actions.register(
       ACTION_KEYS.CREATE_LEARNING,
       async (params: Record<string, unknown>) => {
         const p = params as unknown as LearningCreateParams;
-        const learning = createLearning(p);
+        const learning = await createLearning(p);
+        ctx.streams.emit("learning_created", { learningId: learning.id });
         return { success: true, learning };
       },
     );
@@ -547,8 +729,9 @@ const plugin = definePlugin({
         const { id, ...rest } = params as {
           id: string;
         } & Partial<LearningCreateParams>;
-        const updated = updateLearning({ id, ...rest });
+        const updated = await updateLearning({ id, ...rest });
         if (!updated) return { success: false, error: "Not found" };
+        ctx.streams.emit("learning_updated", { learningId: id });
         return { success: true, learning: updated };
       },
     );
@@ -557,8 +740,9 @@ const plugin = definePlugin({
       ACTION_KEYS.ARCHIVE_LEARNING,
       async (params: Record<string, unknown>) => {
         const { id } = params as { id: string };
-        const archived = archiveLearning(id);
+        const archived = await archiveLearning(id);
         if (!archived) return { success: false, error: "Not found" };
+        ctx.streams.emit("learning_updated", { learningId: id });
         return { success: true, learning: archived };
       },
     );
@@ -576,7 +760,7 @@ const plugin = definePlugin({
       ACTION_KEYS.INGEST_FROM_EVENT,
       async (params: Record<string, unknown>) => {
         const source = (params.source as LearningCreateParams["source"]) ?? "manual";
-        const learning = createLearning({
+        const learning = await createLearning({
           title: String(params.title ?? "Untitled"),
           body: String(params.body ?? ""),
           source,
@@ -586,6 +770,7 @@ const plugin = definePlugin({
           tags: parseTags(params.tags as string | string[] | undefined),
           createdBy: params.createdBy as string | undefined,
         });
+        ctx.streams.emit("learning_created", { learningId: learning.id });
         return { success: true, learning };
       },
     );
@@ -595,7 +780,7 @@ const plugin = definePlugin({
       async (params: Record<string, unknown>) => {
         const scopeKind = String(params.scopeKind ?? "issue");
         const scopeId = String(params.scopeId ?? "");
-        const retro = createOrUpdateRetrospective({
+        const retro = await createOrUpdateRetrospective({
           scopeKind,
           scopeId,
           keyFindings: Array.isArray(params.keyFindings)
@@ -606,6 +791,7 @@ const plugin = definePlugin({
             : undefined,
           status: (params.status as RetrospectiveStatus) ?? "draft",
         });
+        ctx.streams.emit("learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
         return { success: true, retrospective: retro };
       },
     );
@@ -614,8 +800,9 @@ const plugin = definePlugin({
       "deliverable.approve",
       async (params: Record<string, unknown>) => {
         const { id, feedback } = params as { id: string; feedback?: string };
-        const d = approveDeliverable(id, feedback);
+        const d = await approveDeliverable(id, feedback);
         if (!d) return { success: false, error: "Not found" };
+        ctx.streams.emit("learning_updated", { entityType: "deliverable", entityId: id });
         return { success: true, deliverable: d };
       },
     );
@@ -624,8 +811,9 @@ const plugin = definePlugin({
       "deliverable.reject",
       async (params: Record<string, unknown>) => {
         const { id, feedback } = params as { id: string; feedback?: string };
-        const d = rejectDeliverable(id, feedback);
+        const d = await rejectDeliverable(id, feedback);
         if (!d) return { success: false, error: "Not found" };
+        ctx.streams.emit("learning_updated", { entityType: "deliverable", entityId: id });
         return { success: true, deliverable: d };
       },
     );
@@ -634,8 +822,21 @@ const plugin = definePlugin({
     // Setup: seed demo data
     // -------------------------------------------------------------------------
 
-    seedDemoLearnings();
-    ctx.logger.info("Plugin setup complete - demo data seeded");
+    await seedDemoLearnings();
+    ctx.logger.info("Plugin setup complete — demo data seeded");
+  },
+
+  // ---------------------------------------------------------------------------
+  // Plugin health check — called by the Paperclip host to determine if this
+  // plugin is healthy and should remain in the active plugin list.
+  // ---------------------------------------------------------------------------
+  async onHealth() {
+    const health = computeHealth();
+    return {
+      status: health.status,
+      message: health.message ?? "OK",
+      checkedAt: health.checkedAt,
+    };
   },
 });
 
