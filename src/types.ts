@@ -40,6 +40,7 @@ export interface LearningSummary {
 
 export interface LearningQuery {
   query?: string;
+  sourceId?: string; // filter by exact sourceId match
   sources?: LearningSource[];
   tags?: string[];
   priority?: LearningPriority;

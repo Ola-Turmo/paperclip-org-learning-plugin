@@ -277,6 +277,9 @@ export async function queryLearningsWithRanking(q: LearningQuery): Promise<Learn
     results = [..._learnings];
   }
 
+  if (q.sourceId) {
+    results = results.filter(l => l.sourceId === q.sourceId);
+  }
   if (q.sources?.length) {
     results = results.filter(l => q.sources!.includes(l.source));
   }
@@ -307,6 +310,9 @@ export function queryLearnings(q: LearningQuery): Learning[] {
       l.body.toLowerCase().includes(lower) ||
       l.tags.some(t => t.name.toLowerCase().includes(lower))
     );
+  }
+  if (q.sourceId) {
+    results = results.filter(l => l.sourceId === q.sourceId);
   }
   if (q.sources?.length) {
     results = results.filter(l => q.sources!.includes(l.source));

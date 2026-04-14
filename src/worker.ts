@@ -133,7 +133,10 @@ const plugin = definePlugin({
         )) as { goalTitle?: string; agentId?: string } | null;
         const goalTitle = runContext?.goalTitle ?? `Run ${runId}`;
 
-        const learning = await createLearning({
+        // Check for an existing learning for this run — if found, supersede it
+        const existing = queryLearnings({ sourceId: runId, limit: 1 });
+
+        const learningParams = {
           title: `Run failed: ${goalTitle}`,
           body: [
             `Agent run '${runId}' completed with status '${runStatus}'.`,
@@ -142,23 +145,33 @@ const plugin = definePlugin({
             `Review the run logs and capture lessons learned.`,
             `Failure mode: See run logs at https://app.paperclip.ai/runs/${runId}`,
           ].join("\n"),
-          source: "manual",
+          source: "manual" as const,
           sourceId: runId,
           sourceName: `Agent ${agentId}`,
-          priority: "high",
+          priority: "high" as const,
           tags: [
             { name: "agent-run", source: "system" },
             { name: "failed", source: "system" },
           ],
           createdBy: "org-learning-plugin",
-        });
+        };
 
-        ctx.streams.emit("learning_created", { learningId: learning.id });
+        let learningId: string;
+        if (existing.length > 0) {
+          // Supersede the existing learning with an updated version
+          const result = await supersedeLearning(existing[0].id, learningParams);
+          learningId = result!.new.id;
+        } else {
+          const learning = await createLearning(learningParams);
+          learningId = learning.id;
+        }
+
+        ctx.streams.emit("uos.org-learning.learning_created", { learningId });
 
         try {
           await ctx.activity.log({
             companyId: event.companyId,
-            message: `Run ${runId} failed — learning ${learning.id} created`,
+            message: `Run ${runId} failed — learning ${learningId} created`,
             entityType: "run",
             entityId: runId,
           });
@@ -207,7 +220,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
-      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
       ctx.logger.info("agent.run.failed observed — learning created", { runId, agentId, error });
     });
 
@@ -246,7 +259,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
-      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
       ctx.logger.info("agent.run.cancelled observed", { runId, agentId, reason });
     });
 
@@ -289,7 +302,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
-      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
       ctx.logger.info("issue.created observed", { issueId });
     });
 
@@ -329,7 +342,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
-      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
       ctx.logger.info("approval.created observed", { approvalId, requestedFor });
     });
 
@@ -352,7 +365,7 @@ const plugin = definePlugin({
         createdBy: "org-learning-plugin",
       });
 
-      ctx.streams.emit("learning_created", { learningId: learning.id });
+      ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
       ctx.logger.info("approval.decided observed", { approvalId, decision, decidedBy });
     });
 
@@ -433,7 +446,7 @@ const plugin = definePlugin({
           status: "draft",
         });
 
-        ctx.streams.emit("learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
+        ctx.streams.emit("uos.org-learning.learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
 
         try {
           await ctx.activity.log({
@@ -604,7 +617,7 @@ const plugin = definePlugin({
             sourceId: p.sourceId,
             createdBy: "agent",
           });
-          ctx.streams.emit("learning_updated", { entityType: "playbook", entityId: playbook.id });
+          ctx.streams.emit("uos.org-learning.learning_updated", { entityType: "playbook", entityId: playbook.id });
           return {
             content: JSON.stringify({
               id: playbook.id,
@@ -624,7 +637,7 @@ const plugin = definePlugin({
             tags: [...parseTags(p.tags), { name: "policy", source: "system" }],
             createdBy: "agent",
           });
-          ctx.streams.emit("learning_created", { learningId: learning.id });
+          ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
           return {
             content: JSON.stringify({
               id: learning.id,
@@ -644,7 +657,7 @@ const plugin = definePlugin({
           tags: parseTags(p.tags),
           createdBy: "agent",
         });
-        ctx.streams.emit("learning_created", { learningId: learning.id });
+        ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
         return {
           content: JSON.stringify({
             id: learning.id,
@@ -718,7 +731,7 @@ const plugin = definePlugin({
       async (params: Record<string, unknown>) => {
         const p = params as unknown as LearningCreateParams;
         const learning = await createLearning(p);
-        ctx.streams.emit("learning_created", { learningId: learning.id });
+        ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
         return { success: true, learning };
       },
     );
@@ -731,7 +744,7 @@ const plugin = definePlugin({
         } & Partial<LearningCreateParams>;
         const updated = await updateLearning({ id, ...rest });
         if (!updated) return { success: false, error: "Not found" };
-        ctx.streams.emit("learning_updated", { learningId: id });
+        ctx.streams.emit("uos.org-learning.learning_updated", { learningId: id });
         return { success: true, learning: updated };
       },
     );
@@ -742,7 +755,7 @@ const plugin = definePlugin({
         const { id } = params as { id: string };
         const archived = await archiveLearning(id);
         if (!archived) return { success: false, error: "Not found" };
-        ctx.streams.emit("learning_updated", { learningId: id });
+        ctx.streams.emit("uos.org-learning.learning_updated", { learningId: id });
         return { success: true, learning: archived };
       },
     );
@@ -770,7 +783,7 @@ const plugin = definePlugin({
           tags: parseTags(params.tags as string | string[] | undefined),
           createdBy: params.createdBy as string | undefined,
         });
-        ctx.streams.emit("learning_created", { learningId: learning.id });
+        ctx.streams.emit("uos.org-learning.learning_created", { learningId: learning.id });
         return { success: true, learning };
       },
     );
@@ -791,7 +804,7 @@ const plugin = definePlugin({
             : undefined,
           status: (params.status as RetrospectiveStatus) ?? "draft",
         });
-        ctx.streams.emit("learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
+        ctx.streams.emit("uos.org-learning.learning_updated", { entityType: "retrospective", entityId: retro.scopeId });
         return { success: true, retrospective: retro };
       },
     );
@@ -802,7 +815,7 @@ const plugin = definePlugin({
         const { id, feedback } = params as { id: string; feedback?: string };
         const d = await approveDeliverable(id, feedback);
         if (!d) return { success: false, error: "Not found" };
-        ctx.streams.emit("learning_updated", { entityType: "deliverable", entityId: id });
+        ctx.streams.emit("uos.org-learning.learning_updated", { entityType: "deliverable", entityId: id });
         return { success: true, deliverable: d };
       },
     );
@@ -813,7 +826,7 @@ const plugin = definePlugin({
         const { id, feedback } = params as { id: string; feedback?: string };
         const d = await rejectDeliverable(id, feedback);
         if (!d) return { success: false, error: "Not found" };
-        ctx.streams.emit("learning_updated", { entityType: "deliverable", entityId: id });
+        ctx.streams.emit("uos.org-learning.learning_updated", { entityType: "deliverable", entityId: id });
         return { success: true, deliverable: d };
       },
     );
