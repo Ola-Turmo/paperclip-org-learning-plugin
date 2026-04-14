@@ -1,0 +1,35 @@
+{
+  "name": "@uos/plugin-org-learning",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Organizational learning plugin — captures, indexes, and surfaces learnings across the UOS Paperclip ecosystem.",
+  "scripts": {
+    "test": "node --test tests/smoke.test.mjs",
+    "plugin:build": "node ./esbuild.config.mjs",
+    "plugin:dev": "node ./esbuild.config.mjs --watch",
+    "plugin:dev:ui": "paperclip-plugin-dev-server --root . --ui-dir dist/ui --port 4177",
+    "plugin:test": "vitest run --config ./vitest.plugin.config.ts",
+    "plugin:typecheck": "tsc --noEmit -p ./tsconfig.plugin.json"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.325.0",
+    "@rollup/plugin-node-resolve": "^16.0.1",
+    "@rollup/plugin-typescript": "^12.1.2",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.0.8",
+    "esbuild": "^0.27.3",
+    "rollup": "^4.38.0",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  }
+}
