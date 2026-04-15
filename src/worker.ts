@@ -475,18 +475,20 @@ const plugin = definePlugin({
       {
         displayName: "Get Playbooks",
         description:
-          "Returns predefined playbooks relevant to the current context.",
+          "Returns predefined playbooks relevant to the current context (e.g. incident response, code review, architecture decision). Use when asked to follow a standard process or when starting a complex task — playbooks encode institutional SOPs.",
         parametersSchema: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description: "Optional free-text query to filter playbooks.",
+              description:
+                "Optional free-text query to filter playbooks by topic (e.g. 'incident', 'onboarding', 'deployment').",
             },
             tags: {
               type: "array",
               items: { type: "string" },
-              description: "Optional tag filter.",
+              description:
+                "Optional list of tags to filter playbooks (e.g. ['security', 'frontend']).",
             },
           },
         },
@@ -505,11 +507,11 @@ const plugin = definePlugin({
       {
         displayName: "Search Knowledge Base",
         description:
-          "Search the organizational knowledge base using BM25-ranked full-text search across all learnings, playbooks, and policies.",
+          "Search the organizational knowledge base using BM25-ranked full-text search across all learnings, playbooks, and policies. Use this tool whenever you need to look up institutional knowledge before making a decision, performing a task, or answering a question about company processes.",
         parametersSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Free-text search query — searches title, body, and tags." },
+            query: { type: "string", description: "Free-text search query — searches title, body, and tags. Be specific for best results." },
             sources: {
               type: "array",
               items: { type: "string" },
@@ -518,7 +520,7 @@ const plugin = definePlugin({
             tags: {
               type: "array",
               items: { type: "string" },
-              description: "Optional tag filter.",
+              description: "Optional tag filter (e.g. ['security', 'frontend']).",
             },
             limit: {
               type: "number",
@@ -557,34 +559,35 @@ const plugin = definePlugin({
       TOOL_KEYS.RECORD_LEARNING,
       {
         displayName: "Record Learning",
-        description: "Records a new learning artifact (knowledge entry, playbook, or policy).",
+        description:
+          "Records a new learning artifact (knowledge entry, playbook, or policy). Use whenever you discover something worth preserving — a lesson learned from an incident, a standard process, a decision rationale, or any institutional knowledge that should be searchable and reusable.",
         parametersSchema: {
           type: "object",
           properties: {
             kind: {
               type: "string",
               enum: ["knowledge_entry", "playbook", "policy"],
-              description: "Kind of artifact.",
+              description: "Kind of artifact: 'knowledge_entry' (general Q&A/how-to), 'playbook' (step-by-step SOP), or 'policy' (rule or constraint).",
             },
             title: {
               type: "string",
               description: "Short descriptive title (max 120 chars).",
             },
-            body: { type: "string", description: "Full content of the artifact." },
+            body: { type: "string", description: "Full content of the artifact. Markdown supported — include enough detail to be actionable." },
             source: {
               type: "string",
               description: "Source: 'incident', 'manual', 'approval', 'agent_run', 'project'.",
             },
-            sourceId: { type: "string", description: "Optional source entity ID." },
+            sourceId: { type: "string", description: "Optional ID of the source entity (e.g. issue ID, run ID) for traceability." },
             priority: {
               type: "string",
               enum: ["critical", "high", "medium", "low"],
-              description: "Priority.",
+              description: "Priority level. Defaults to 'medium'.",
             },
             tags: {
               type: "array",
               items: { type: "string" },
-              description: "Optional tags.",
+              description: "Optional tags for retrieval (e.g. ['security', 'frontend', 'deployment']).",
             },
           },
           required: ["kind", "title", "body", "source"],
