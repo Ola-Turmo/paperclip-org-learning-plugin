@@ -48,19 +48,19 @@ interface DbConfig {
 }
 
 function getConfig(): DbConfig | null {
-  const url  = process.env.SURREALDB_URL      ?? process.env.SURREAL_DB_URL      ?? "";
-  const user = process.env.SURREALDB_USER     ?? process.env.SURREAL_DB_USER     ?? "root";
-  const pass = process.env.SURREALDB_PASS     ?? process.env.SURREAL_DB_PASS     ?? "";
-  const ns   = process.env.SURREALDB_NS       ?? process.env.SURREAL_DB_NS       ?? "";
-  const db   = process.env.SURREALDB_DB       ?? process.env.SURREAL_DB_DB       ?? "";
+  const url  = process.env.SURREAL_ENDPOINT     ?? process.env.SURREALDB_URL      ?? "";
+  const user = process.env.SURREAL_USER          ?? process.env.SURREALDB_USER     ?? "root";
+  const pass = process.env.SURREAL_PASS          ?? process.env.SURREALDB_PASS     ?? "";
+  const ns   = process.env.SURREAL_NAMESPACE     ?? process.env.SURREALDB_NS       ?? "";
+  const db   = process.env.SURREAL_DATABASE      ?? process.env.SURREALDB_DB       ?? "";
 
   if (!url || !pass) return null;
   return {
     url,
     user,
     pass,
-    namespace: ns  || "demo",
-    database:   db  || "surreal_deal_store",
+    namespace: ns  || "main",
+    database:   db  || "main",
   };
 }
 
@@ -90,8 +90,13 @@ async function _doConnect(config: DbConfig): Promise<boolean> {
   try {
     _db = new Surreal();
     await _db.connect(config.url);
-    await _db.use({ namespace: config.namespace, database: config.database });
-    await _db.signin({ username: config.user, password: config.pass });
+    // Pass NS/DB directly to signin() — SurrealDB Cloud requires this for NS-level auth
+    await _db.signin({
+      namespace: config.namespace,
+      database:  config.database,
+      username:  config.user,
+      password:  config.pass,
+    });
 
     // Initialize schema — define tables + indexes once
     await _ensureSchema();
@@ -119,7 +124,7 @@ async function _ensureSchema(): Promise<void> {
 
   // Tables — SCHEMAFULL enforces field types at write time
   for (const table of ["learning", "playbook", "policy", "deliverable", "scorecard", "retrospective", "audit_entry"]) {
-    await _db.query(`DEFINE TABLE ${table} SCHEMAFULL PERMISSIONS FULL;`);
+    await _db.query(`DEFINE TABLE IF NOT EXISTS ${table} SCHEMAFULL PERMISSIONS FULL;`);
   }
 
   // Learning indexes
@@ -128,6 +133,24 @@ async function _ensureSchema(): Promise<void> {
   await _db.query(`DEFINE INDEX IF NOT EXISTS idx_learning_priority  ON learning COLUMNS priority;`);
   await _db.query(`DEFINE INDEX IF NOT EXISTS idx_learning_updated   ON learning COLUMNS updatedAt;`);
   await _db.query(`DEFINE INDEX IF NOT EXISTS idx_learning_created   ON learning COLUMNS createdAt;`);
+
+  // Learning fields — MUST define fields so SCHEMAFULL optional/array fields get defaults
+  // Without this, UPSERT without a field value fails: SCHEMAFULL rejects NONE for non-optional fields
+  for (const [name, type, defaultVal] of [
+    ["title","string",""], ["body","string",""], ["source","string",""],
+    ["status","string",""], ["priority","string",""],
+    ["createdAt","string",""], ["updatedAt","string",""],
+  ]) {
+    try { await _db.query(`DEFINE FIELD ${name} ON learning TYPE ${type} DEFAULT "${defaultVal}" FLEXIBLE;`); } catch {}
+  }
+  // Optional fields — default to NONE so they can be absent from UPSERT
+  for (const name of ["sourceId","sourceName","createdBy","supersededBy"]) {
+    try { await _db.query(`DEFINE FIELD ${name} ON learning TYPE option<string> DEFAULT NONE FLEXIBLE;`); } catch {}
+  }
+  // Array fields — default to empty array
+  for (const name of ["tags","supersedes"]) {
+    try { await _db.query(`DEFINE FIELD ${name} ON learning TYPE array DEFAULT [] FLEXIBLE;`); } catch {}
+  }
 
   // Playbook indexes
   await _db.query(`DEFINE INDEX IF NOT EXISTS idx_playbook_updated   ON playbook COLUMNS updatedAt;`);
@@ -223,38 +246,29 @@ function rowToLearning(r: Record<string, unknown>): Learning {
 export async function dbUpsertLearning(learning: Learning): Promise<Learning> {
   if (!_db) throw new Error("Database not connected");
   const recordId = `learning:${learning.id}`;
+
+  // Build field setters conditionally so optional fields aren't passed as null
+  // (SurrealDB SCHEMAFULL OPTION<STRING> fields reject null — omit them instead)
+  const sets = [
+    "title = $title", "body = $body", "source = $source",
+    "status = $status", "priority = $priority",
+    "createdAt = $createdAt", "updatedAt = $updatedAt",
+  ];
+  const vars: Record<string, unknown> = {
+    title: learning.title, body: learning.body, source: learning.source,
+    status: learning.status, priority: learning.priority,
+    createdAt: learning.createdAt, updatedAt: learning.updatedAt,
+  };
+  // Always include tags and supersedes — SCHEMAFULL array fields reject NONE
+  // when absent from UPSERT; DEFAULT on the field def doesn't apply here
+  sets.push("tags = $tags", "supersedes = $supersedes");
+  vars.tags = learning.tags ?? [];
+  vars.supersedes = learning.supersedes ?? [];
+  // Optional string fields — omit from SET when undefined (SCHEMAFULL option<string> accepts NONE)
+  if (learning.sourceId !== undefined)    { sets.push("sourceId = $sourceId");     vars.sourceId     = learning.sourceId; }
+
   const [result] = await _db.query<[Record<string, unknown>[]]>(
-    /* SurrealQL UPSERT — creates or replaces by record ID */
-    `UPSERT ${recordId} SET
-      title       = $title,
-      body        = $body,
-      source      = $source,
-      sourceId    = $sourceId,
-      sourceName  = $sourceName,
-      tags        = $tags,
-      status      = $status,
-      priority    = $priority,
-      createdAt   = $createdAt,
-      updatedAt   = $updatedAt,
-      createdBy   = $createdBy,
-      supersededBy = $supersededBy,
-      supersedes  = $supersedes
-    RETURN *`,
-    {
-      title:       learning.title,
-      body:        learning.body,
-      source:      learning.source,
-      sourceId:    learning.sourceId ?? null,
-      sourceName:  learning.sourceName ?? null,
-      tags:        learning.tags,
-      status:      learning.status,
-      priority:    learning.priority,
-      createdAt:   learning.createdAt,
-      updatedAt:   learning.updatedAt,
-      createdBy:   learning.createdBy ?? null,
-      supersededBy: learning.supersededBy ?? null,
-      supersedes:  learning.supersedes ?? null,
-    }
+    `UPSERT ${recordId} SET ${sets.join(", ")} RETURN *`, vars
   );
   if (!result?.length) throw new Error("UPSERT learning failed");
   return rowToLearning(result[0]);
@@ -349,22 +363,16 @@ function rowToPlaybook(r: Record<string, unknown>): Playbook {
 
 export async function dbUpsertPlaybook(p: Playbook): Promise<Playbook> {
   if (!_db) throw new Error("Database not connected");
+  const sets = ["title = $title", "body = $body", "tags = $tags",
+    "createdAt = $createdAt", "updatedAt = $updatedAt"];
+  const vars: Record<string, unknown> = {
+    title: p.title, body: p.body, tags: p.tags,
+    createdAt: p.createdAt, updatedAt: p.updatedAt,
+  };
+  if (p.sourceInfo !== undefined) { sets.push("sourceInfo = $sourceInfo"); vars.sourceInfo = p.sourceInfo; }
+  if (p.createdBy !== undefined)  { sets.push("createdBy = $createdBy");  vars.createdBy  = p.createdBy; }
   const [result] = await _db.query<[Record<string, unknown>[]]>(
-    `UPSERT playbook:${p.id} SET
-      title      = $title,
-      body       = $body,
-      tags       = $tags,
-      sourceInfo = $sourceInfo,
-      createdAt  = $createdAt,
-      updatedAt  = $updatedAt,
-      createdBy  = $createdBy
-    RETURN *`,
-    {
-      title: p.title, body: p.body, tags: p.tags,
-      sourceInfo: p.sourceInfo ?? null,
-      createdAt: p.createdAt, updatedAt: p.updatedAt,
-      createdBy: p.createdBy ?? null,
-    }
+    `UPSERT playbook:${p.id} SET ${sets.join(", ")} RETURN *`, vars
   );
   if (!result?.length) throw new Error("UPSERT playbook failed");
   return rowToPlaybook(result[0]);
@@ -402,22 +410,16 @@ function rowToPolicy(r: Record<string, unknown>): Policy {
 
 export async function dbUpsertPolicy(p: Policy): Promise<Policy> {
   if (!_db) throw new Error("Database not connected");
+  const sets = ["title = $title", "body = $body", "tags = $tags",
+    "createdAt = $createdAt", "updatedAt = $updatedAt"];
+  const vars: Record<string, unknown> = {
+    title: p.title, body: p.body, tags: p.tags,
+    createdAt: p.createdAt, updatedAt: p.updatedAt,
+  };
+  if (p.sourceInfo !== undefined) { sets.push("sourceInfo = $sourceInfo"); vars.sourceInfo = p.sourceInfo; }
+  if (p.createdBy !== undefined)  { sets.push("createdBy = $createdBy");  vars.createdBy  = p.createdBy; }
   const [result] = await _db.query<[Record<string, unknown>[]]>(
-    `UPSERT policy:${p.id} SET
-      title      = $title,
-      body       = $body,
-      tags       = $tags,
-      sourceInfo = $sourceInfo,
-      createdAt  = $createdAt,
-      updatedAt  = $updatedAt,
-      createdBy  = $createdBy
-    RETURN *`,
-    {
-      title: p.title, body: p.body, tags: p.tags,
-      sourceInfo: p.sourceInfo ?? null,
-      createdAt: p.createdAt, updatedAt: p.updatedAt,
-      createdBy: p.createdBy ?? null,
-    }
+    `UPSERT policy:${p.id} SET ${sets.join(", ")} RETURN *`, vars
   );
   if (!result?.length) throw new Error("UPSERT policy failed");
   return rowToPolicy(result[0]);
@@ -447,21 +449,16 @@ function rowToDeliverable(r: Record<string, unknown>): Deliverable {
 
 export async function dbUpsertDeliverable(d: Deliverable): Promise<Deliverable> {
   if (!_db) throw new Error("Database not connected");
+  const sets = ["relatedRunId = $relatedRunId", "agentId = $agentId",
+    "status = $status", "createdAt = $createdAt", "updatedAt = $updatedAt"];
+  const vars: Record<string, unknown> = {
+    relatedRunId: d.relatedRunId, agentId: d.agentId,
+    status: d.status, createdAt: d.createdAt, updatedAt: d.updatedAt,
+  };
+  if (d.feedback !== undefined) { sets.push("feedback = $feedback"); vars.feedback = d.feedback; }
+  if (d.score !== undefined)    { sets.push("score = $score");      vars.score    = d.score; }
   const [result] = await _db.query<[Record<string, unknown>[]]>(
-    `UPSERT deliverable:${d.id} SET
-      relatedRunId = $relatedRunId,
-      agentId      = $agentId,
-      status       = $status,
-      feedback     = $feedback,
-      score        = $score,
-      createdAt    = $createdAt,
-      updatedAt    = $updatedAt
-    RETURN *`,
-    {
-      relatedRunId: d.relatedRunId, agentId: d.agentId,
-      status: d.status, feedback: d.feedback ?? null, score: d.score ?? null,
-      createdAt: d.createdAt, updatedAt: d.updatedAt,
-    }
+    `UPSERT deliverable:${d.id} SET ${sets.join(", ")} RETURN *`, vars
   );
   if (!result?.length) throw new Error("UPSERT deliverable failed");
   return rowToDeliverable(result[0]);
@@ -615,8 +612,13 @@ export async function dbSelectRetrospective(scopeKind: string, scopeId: string):
 
 export async function dbAppendAudit(a: AuditEntry): Promise<void> {
   if (!_db) return;
+  const vars: Record<string, unknown> = {
+    action: a.action, actorId: a.actorId, actorType: a.actorType, timestamp: a.timestamp,
+  };
+  // Omit note from the INSERT if not provided — SurrealDB SCHEMAFULL optional fields reject null
+  if (a.note !== undefined) vars.note = a.note;
   await _db.query(
     `INSERT INTO audit_entry { action: $action, actorId: $actorId, actorType: $actorType, note: $note, timestamp: $timestamp }`,
-    { action: a.action, actorId: a.actorId, actorType: a.actorType, note: a.note ?? null, timestamp: a.timestamp }
+    vars
   );
 }
